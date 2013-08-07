@@ -8,7 +8,7 @@ import Test.HUnit hiding (Test)
 import Data.Maybe
 import Data.Monoid
 import Data.List (find)
-import Crypto.Random
+import Crypto.Random.API
 import Data.Binary
 import qualified Data.OpenPGP as OpenPGP
 import qualified Data.OpenPGP.CryptoAPI as OpenPGP
@@ -72,7 +72,7 @@ testDecryptSecretKey pass file = do
 	let d = OpenPGP.decryptSecretKey (BS.fromString pass) m
 	assertEqual "Decrypt secret key" True (isJust d)
 
-prop_sign_and_verify :: (CryptoRandomGen g) => OpenPGP.Message -> g -> OpenPGP.HashAlgorithm -> String -> String -> Gen Bool
+prop_sign_and_verify :: (CPRG g) => OpenPGP.Message -> g -> OpenPGP.HashAlgorithm -> String -> String -> Gen Bool
 prop_sign_and_verify secring g halgo filename msg = do
 	keyid <- elements ["FEF8AFA0F661C3EE","7F69FA376B020509"]
 	let m = OpenPGP.LiteralDataPacket {
@@ -86,7 +86,7 @@ prop_sign_and_verify secring g halgo filename msg = do
 	let OpenPGP.DataSignature _ ss = OpenPGP.verify secring sig
 	return (length ss == 1)
 
-prop_encrypt_and_decrypt :: (CryptoRandomGen g) => OpenPGP.Message -> g -> BS.ByteString -> OpenPGP.SymmetricAlgorithm -> String -> String -> Bool
+prop_encrypt_and_decrypt :: (CPRG g) => OpenPGP.Message -> g -> BS.ByteString -> OpenPGP.SymmetricAlgorithm -> String -> String -> Bool
 prop_encrypt_and_decrypt secring g pass algo filename msg =
 	case (OpenPGP.encrypt [] secring algo m g, OpenPGP.encrypt [pass] mempty algo m g) of
 		(Left _, _) -> False
@@ -102,7 +102,7 @@ prop_encrypt_and_decrypt secring g pass algo filename msg =
 			OpenPGP.content = LZ.fromString msg
 		}]
 
-tests :: (CryptoRandomGen g) => OpenPGP.Message -> OpenPGP.Message -> g -> [Test]
+tests :: (CPRG g) => OpenPGP.Message -> OpenPGP.Message -> g -> [Test]
 tests secring oneKey rng =
 	[
 		testGroup "Fingerprint" [
@@ -140,7 +140,8 @@ tests secring oneKey rng =
 
 main :: IO ()
 main = do
-	rng <- newGenIO :: IO SystemRandom
+	-- rng <- newGenIO :: IO SystemRandom
+	rng <- getSystemRandomGen
 	secring <- fmap decode $ LZ.readFile "tests/data/secring.gpg"
 	oneKey <- fmap decode $ LZ.readFile "tests/data/helloKey.gpg"
 	defaultMain (tests secring oneKey rng)

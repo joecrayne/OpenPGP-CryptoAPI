@@ -10,21 +10,19 @@ import Control.Monad
 import Control.Monad.Trans.Class (lift)
 import Control.Monad.Trans.State (StateT(..), runStateT)
 import Data.Binary (encode, decode, get, Word16)
-import Crypto.Classes hiding (hash,sign,verify,encode)
+import Crypto.Classes hiding (hash,sign,verify,encode,cfb,unCfb)
 import Data.Tagged (untag, asTaggedTypeOf, Tagged(..))
-import Crypto.Modes (cfb, unCfb, IV, zeroIV)
-import Crypto.Random (CryptoRandomGen, GenError(GenErrorOther), genBytes)
-import Crypto.Hash.MD5 (MD5)
-import Crypto.Hash.SHA1 (SHA1)
-import Crypto.Hash.RIPEMD160 (RIPEMD160)
-import Crypto.Hash.SHA256 (SHA256)
-import Crypto.Hash.SHA384 (SHA384)
-import Crypto.Hash.SHA512 (SHA512)
-import Crypto.Hash.SHA224 (SHA224)
-import Crypto.Cipher.AES (AES128,AES192,AES256)
+import Crypto.Modes (cfb, unCfb, zeroIV)
+import Crypto.Types (IV)
+import Crypto.Random (GenError(GenErrorOther))
+import Crypto.Hash.CryptoAPI (MD5,SHA1,RIPEMD160,SHA256,SHA384,SHA512,SHA224)
+import Crypto.Random.API (CPRG,cprgGenBytes)
+import Data.OpenPGP.CryptoAPI.AES (AES128,AES192,AES256)
 import qualified Data.Serialize as Serialize
-import qualified Crypto.Cipher.RSA as RSA
-import qualified Crypto.Cipher.DSA as DSA
+import qualified Crypto.PubKey.RSA as RSA
+import qualified Crypto.PubKey.RSA.PKCS15 as RSA
+import Crypto.PubKey.HashDescr
+import qualified Crypto.PubKey.DSA as DSA
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Lazy as LZ
 
@@ -40,7 +38,7 @@ type Decrypt = (Bool -> LZ.ByteString -> (LZ.ByteString, LZ.ByteString))
 
 -- Start differently-formatted section
 -- | This should be in Crypto.Classes and is based on buildKeyIO
-buildKeyGen :: (BlockCipher k, CryptoRandomGen g) => g -> Either GenError (k, g)
+buildKeyGen :: (BlockCipher k, CPRG g) => g -> Either GenError (k, g)
 buildKeyGen = runStateT (go (0::Int))
   where
   go 1000 = lift $ Left $ GenErrorOther
@@ -50,7 +48,7 @@ buildKeyGen = runStateT (go (0::Int))
                   \ keyspace."
   go i = do
 	let bs = keyLength
-	kd <- StateT $ genBytes ((7 + untag bs) `div` 8)
+	kd <- StateT $ \g -> return $ cprgGenBytes ((7 + untag bs) `div` 8) g
 	case buildKey kd of
 		Nothing -> go (i+1)
 		Just k  -> return $ k `asTaggedTypeOf` bs
@@ -76,29 +74,17 @@ hash_ d bs = (hbs, map toUpper $ pad $ hexString $ BS.unpack hbs)
 	pad s = replicate (len - length s) '0' ++ s
 	len = (outputLength `for` d) `div` 8
 
--- http://tools.ietf.org/html/rfc3447#page-43
--- http://tools.ietf.org/html/rfc4880#section-5.2.2
-emsa_pkcs1_v1_5_hash_padding :: OpenPGP.HashAlgorithm -> BS.ByteString
-emsa_pkcs1_v1_5_hash_padding OpenPGP.MD5 = BS.pack [0x30, 0x20, 0x30, 0x0c, 0x06, 0x08, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x02, 0x05, 0x05, 0x00, 0x04, 0x10]
-emsa_pkcs1_v1_5_hash_padding OpenPGP.SHA1 = BS.pack [0x30, 0x21, 0x30, 0x09, 0x06, 0x05, 0x2b, 0x0e, 0x03, 0x02, 0x1a, 0x05, 0x00, 0x04, 0x14]
-emsa_pkcs1_v1_5_hash_padding OpenPGP.RIPEMD160 = BS.pack [0x30, 0x21, 0x30, 0x09, 0x06, 0x05, 0x2B, 0x24, 0x03, 0x02, 0x01, 0x05, 0x00, 0x04, 0x14]
-emsa_pkcs1_v1_5_hash_padding OpenPGP.SHA256 = BS.pack [0x30, 0x31, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01, 0x05, 0x00, 0x04, 0x20]
-emsa_pkcs1_v1_5_hash_padding OpenPGP.SHA384 = BS.pack [0x30, 0x41, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x02, 0x05, 0x00, 0x04, 0x30]
-emsa_pkcs1_v1_5_hash_padding OpenPGP.SHA512 = BS.pack [0x30, 0x51, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x03, 0x05, 0x00, 0x04, 0x40]
-emsa_pkcs1_v1_5_hash_padding OpenPGP.SHA224 = BS.pack [0x30, 0x31, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x04, 0x05, 0x00, 0x04, 0x1C]
-emsa_pkcs1_v1_5_hash_padding _ =
-	error "Unsupported HashAlgorithm in emsa_pkcs1_v1_5_hash_padding."
 
 blockBytes :: (BlockCipher k, Num n) => k -> n
 blockBytes k = fromIntegral $ blockSizeBytes `for` k
 
-pgpCFBPrefix :: (BlockCipher k, CryptoRandomGen g) => k -> g -> (LZ.ByteString, g)
+pgpCFBPrefix :: (BlockCipher k, CPRG g) => k -> g -> (LZ.ByteString, g)
 pgpCFBPrefix k g =
 	(toLazyBS $ str `BS.append` BS.reverse (BS.take 2 $ BS.reverse str), g')
 	where
-	Right (str,g') = genBytes (blockSizeBytes `for` k) g
+	(str,g') = cprgGenBytes (blockSizeBytes `for` k) g
 
-pgpCFB :: (BlockCipher k, CryptoRandomGen g) => k -> (LZ.ByteString -> LZ.ByteString -> LZ.ByteString) -> Encrypt g
+pgpCFB :: (BlockCipher k, CPRG g) => k -> (LZ.ByteString -> LZ.ByteString -> LZ.ByteString) -> Encrypt g
 pgpCFB k sufGen bs g =
 	(simpleCFB k zeroIV (LZ.concat [p, bs, sufGen p bs]), g')
 	where
@@ -133,14 +119,14 @@ addBitLen bytes = encode (bitLen bytes :: Word16) `LZ.append` bytes
 
 -- Drops 2 because the value is an MPI
 rsaDecrypt :: RSA.PrivateKey -> BS.ByteString -> Maybe BS.ByteString
-rsaDecrypt pk = hush . RSA.decrypt pk . BS.drop 2
+rsaDecrypt pk = hush . RSA.decrypt Nothing pk . BS.drop 2
 
-rsaEncrypt :: (CryptoRandomGen g) => RSA.PublicKey -> BS.ByteString -> StateT g (Either GenError) BS.ByteString
+rsaEncrypt :: (CPRG g) => RSA.PublicKey -> BS.ByteString -> StateT g (Either GenError) BS.ByteString
 rsaEncrypt pk bs = StateT (\g ->
 		case RSA.encrypt g pk bs of
-			(Left (RSA.RandomGenFailure e)) -> Left e
-			(Left e) -> Left (GenErrorOther $ show e)
-			(Right v) -> Right v
+			-- (Left (RSA.RandomGenFailure e)) -> Left e
+			(Left e,_) -> Left (GenErrorOther $ show e)
+			(Right v,g) -> Right (v,g)
 	)
 
 integerBytesize :: Integer -> Int
@@ -184,11 +170,13 @@ rsaKey k =
 
 privateDSAkey :: OpenPGP.Packet -> DSA.PrivateKey
 privateDSAkey k = DSA.PrivateKey
-	(keyParam 'p' k, keyParam 'g' k, keyParam 'q' k) (keyParam 'x' k)
+	(DSA.Params (keyParam 'p' k) (keyParam 'g' k) (keyParam 'q' k))
+    (keyParam 'x' k)
 
 dsaKey :: OpenPGP.Packet -> DSA.PublicKey
 dsaKey k = DSA.PublicKey
-	(keyParam 'p' k, keyParam 'g' k, keyParam 'q' k) (keyParam 'y' k)
+	(DSA.Params (keyParam 'p' k) (keyParam 'g' k) (keyParam 'q' k))
+    (keyParam 'y' k)
 
 -- | Generate a key fingerprint from a PublicKeyPacket or SecretKeyPacket
 -- <http://tools.ietf.org/html/rfc4880#section-12.2>
@@ -219,21 +207,32 @@ verifyOne keys sig over = fmap (const sig) $ maybeKey >>=
 		    | otherwise -> const Nothing
 	where
 	dsaVerify k = let k' = dsaKey k in
-		hush $ DSA.verify dsaSig (dsaTruncate k' . bhash) k' over
-	rsaVerify k = hush $ RSA.verify bhash padding (rsaKey k) over rsaSig
+		Just $ DSA.verify (dsaTruncate k' . bhash) k' dsaSig over
+	rsaVerify k = Just $ RSA.verify desc (rsaKey k) over rsaSig
 	[rsaSig] = map (toStrictBS . LZ.drop 2 . encode) (OpenPGP.signature sig)
 	dsaSig = let [OpenPGP.MPI r, OpenPGP.MPI s] = OpenPGP.signature sig in
-		(r, s)
-	dsaTruncate (DSA.PublicKey (_,_,q) _) = BS.take (integerBytesize q)
+		DSA.Signature r s
+	dsaTruncate (DSA.PublicKey (DSA.Params _ _ q) _) = BS.take (integerBytesize q)
 	bhash = fst . hash hash_algo . toLazyBS
-	padding = emsa_pkcs1_v1_5_hash_padding hash_algo
+	-- padding = emsa_pkcs1_v1_5_hash_padding hash_algo
+	desc = hashAlgoDesc hash_algo
 	hash_algo = OpenPGP.hash_algorithm sig
 	maybeKey = OpenPGP.signature_issuer sig >>= find_key keys
+
+hashAlgoDesc OpenPGP.MD5       = hashDescrMD5
+hashAlgoDesc OpenPGP.SHA1      = hashDescrSHA1
+hashAlgoDesc OpenPGP.RIPEMD160 = hashDescrRIPEMD160
+hashAlgoDesc OpenPGP.SHA256    = hashDescrSHA256
+hashAlgoDesc OpenPGP.SHA384    = hashDescrSHA384
+hashAlgoDesc OpenPGP.SHA512    = hashDescrSHA512
+hashAlgoDesc OpenPGP.SHA224    = hashDescrSHA224
+hashAlgoDesc _ =
+	error "Unsupported HashAlgorithm in hashAlgoDesc"
 
 -- | Make a signature
 --
 -- In order to set more options on a signature, pass in a signature packet.
-sign :: (CryptoRandomGen g) =>
+sign :: (CPRG g) => -- CryptoRandomGen g) =>
 	OpenPGP.Message          -- ^ SecretKeys, one of which will be used
 	-> OpenPGP.SignatureOver -- ^ Data to sign, and optional signature packet
 	-> OpenPGP.HashAlgorithm -- ^ HashAlgorithm to use in signature
@@ -248,13 +247,14 @@ sign keys over hsh keyid timestamp g = (over {OpenPGP.signatures_over = [sig]}, 
 		kalgo | kalgo `elem` [OpenPGP.RSA,OpenPGP.RSA_S] -> ([toNum rsaFinal], g)
 		      | otherwise ->
 			error ("Unsupported key algorithm " ++ show kalgo ++ "in sign")
-	Right ((dsaR,dsaS),dsaG) = let k' = privateDSAkey k in
-		DSA.sign g (dsaTruncate k' . bhash) k' dta
-	Right rsaFinal = RSA.sign bhash padding (privateRSAkey k) dta
-	dsaTruncate (DSA.PrivateKey (_,_,q) _) = BS.take (integerBytesize q)
+	(DSA.Signature dsaR dsaS,dsaG) = let k' = privateDSAkey k in
+		DSA.sign g k' (dsaTruncate k' . bhash) dta
+	(Right rsaFinal,_) = RSA.signSafer g desc (privateRSAkey k) dta
+	dsaTruncate (DSA.PrivateKey (DSA.Params _ _ q) _) = BS.take (integerBytesize q)
 	dta     = toStrictBS $ encode over `LZ.append` OpenPGP.trailer sig
 	sig     = findSigOrDefault (listToMaybe $ OpenPGP.signatures_over over)
-	padding = emsa_pkcs1_v1_5_hash_padding hsh
+	-- padding = emsa_pkcs1_v1_5_hash_padding hsh
+	desc = hashAlgoDesc hsh
 	bhash   = fst . hash hsh . toLazyBS
 	toNum   = BS.foldl (\a b -> a `shiftL` 8 .|. fromIntegral b) 0
 	Just k  = find_key keys keyid
@@ -302,7 +302,7 @@ sign keys over hsh keyid timestamp g = (over {OpenPGP.signatures_over = [sig]}, 
 		OpenPGP.SubkeySignature {}        -> 0x18
 		OpenPGP.CertificationSignature {} -> 0x13
 
-encrypt :: (CryptoRandomGen g) =>
+encrypt :: (CPRG g) =>
 	[BS.ByteString]               -- ^ Passphrases, all of which will be used
 	-> OpenPGP.Message            -- ^ PublicKeys, all of which will be used
 	-> OpenPGP.SymmetricAlgorithm -- ^ Cipher to use
@@ -315,7 +315,7 @@ encrypt pass (OpenPGP.Message keys) algo msg = runStateT $ do
 		(mapM (encryptSessionKeyAsymmetric sk) (filter isKey keys))
 		(mapM (encryptSessionKeySymmetric (LZ.take (LZ.length sk - 2) sk) algo) pass)
 
-encryptSessionKeyAsymmetric :: (CryptoRandomGen g) => LZ.ByteString -> OpenPGP.Packet -> StateT g (Either GenError) OpenPGP.Packet
+encryptSessionKeyAsymmetric :: (CPRG g) => LZ.ByteString -> OpenPGP.Packet -> StateT g (Either GenError) OpenPGP.Packet
 encryptSessionKeyAsymmetric sk pk = OpenPGP.AsymmetricSessionKeyPacket 3
 	(fingerprint pk)
 	(OpenPGP.key_algorithm pk)
@@ -324,7 +324,7 @@ encryptSessionKeyAsymmetric sk pk = OpenPGP.AsymmetricSessionKeyPacket 3
 	encd OpenPGP.RSA = toLazyBS <$> rsaEncrypt (rsaKey pk) (toStrictBS sk)
 	encd _ = lift $ Left $ GenErrorOther $ "Unsupported PublicKey: " ++ show pk
 
-encryptSessionKeySymmetric :: (CryptoRandomGen g) => LZ.ByteString -> OpenPGP.SymmetricAlgorithm -> BS.ByteString -> StateT g (Either GenError) OpenPGP.Packet
+encryptSessionKeySymmetric :: (CPRG g) => LZ.ByteString -> OpenPGP.SymmetricAlgorithm -> BS.ByteString -> StateT g (Either GenError) OpenPGP.Packet
 encryptSessionKeySymmetric sk salgo pass = do
 	s2k <- s2k
 	return $ OpenPGP.SymmetricSessionKeyPacket 4 salgo s2k
@@ -332,7 +332,7 @@ encryptSessionKeySymmetric sk salgo pass = do
 	where
 	halgo = s2kHashAlgorithmFor salgo
 	s2k = OpenPGP.IteratedSaltedS2K halgo . decode . toLazyBS <$>
-		(StateT $ genBytes 8) <*> pure 65536
+		(StateT $ \g -> Right $ cprgGenBytes 8 g) <*> pure 65536
 
 s2kHashAlgorithmFor :: OpenPGP.SymmetricAlgorithm -> OpenPGP.HashAlgorithm
 s2kHashAlgorithmFor OpenPGP.AES128 = s2kHashAlgorithm `for` (undefined :: AES128)
@@ -353,7 +353,7 @@ s2kHashAlgorithm = v
 tagOfTag :: Tagged a c -> Tagged a b -> c
 tagOfTag a b = a `for` (undefined `asTaggedTypeOf` b)
 
-sessionFor :: (CryptoRandomGen g) => OpenPGP.SymmetricAlgorithm -> OpenPGP.Message -> StateT g (Either GenError) (LZ.ByteString, OpenPGP.Packet)
+sessionFor :: (CPRG g) => OpenPGP.SymmetricAlgorithm -> OpenPGP.Message -> StateT g (Either GenError) (LZ.ByteString, OpenPGP.Packet)
 sessionFor algo@OpenPGP.AES128 msg = do
 	sk <- StateT buildKeyGen
 	encP <- newSession (sk :: AES128) msg
@@ -378,7 +378,7 @@ sessionKeyEncode sk algo =
 	where
 	bs = Serialize.encode sk
 
-newSession :: (BlockCipher k, CryptoRandomGen g, Monad m) => k -> OpenPGP.Message -> StateT g m OpenPGP.Packet
+newSession :: (BlockCipher k, CPRG g, Monad m) => k -> OpenPGP.Message -> StateT g m OpenPGP.Packet
 newSession sk msg = do
 	encd <- StateT $ return . pgpCFB sk (encode `oo` mkMDC) (encode msg)
 	return $ OpenPGP.EncryptedDataPacket 1 encd

@@ -63,10 +63,19 @@ library
                 binary >= 0.6.4.0,
                 openpgp >= 0.6,
                 crypto-api >= 0.9,
+                crypto-pubkey >= 0.1.3,
                 tagged,
                 cryptocipher >= 0.3.6,
+                cryptocipher,
                 cryptohash,
-                cereal
+                cereal,
+                cpu,
+                primitive,
+                ghc-prim,
+                vector,
+                Crypto,
+                cryptohash-cryptoapi,
+                crypto-random-api
 
 test-suite tests
         type:       exitcode-stdio-1.0
@@ -89,7 +98,15 @@ test-suite tests
                 quickcheck-instances,
                 test-framework,
                 test-framework-hunit,
-                test-framework-quickcheck2
+                test-framework-quickcheck2,
+                vector,
+                crypto-pubkey,
+                cpu,
+                primitive,
+                ghc-prim,
+                crypto-random-api,
+                cryptohash-cryptoapi
+
 
 source-repository head
         type:     git
