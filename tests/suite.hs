@@ -28,6 +28,11 @@ isLiteral :: OpenPGP.Packet -> Bool
 isLiteral (OpenPGP.LiteralDataPacket {}) = True
 isLiteral                              _ = False
 
+modifyLiteralPacket :: OpenPGP.Packet -> OpenPGP.Packet
+modifyLiteralPacket d@(OpenPGP.LiteralDataPacket { OpenPGP.content = cnt }) =
+	d { OpenPGP.content = LZ.cons 0x00 $ LZ.map (xor 0xFF) cnt }
+modifyLiteralPacket nonliteral = nonliteral
+
 testFingerprint :: FilePath -> String -> Assertion
 testFingerprint fp kf = do
 	bs <- LZ.readFile $ "tests/data/" ++ fp
@@ -42,19 +47,14 @@ testVerifyMessage keyring message = do
 		OpenPGP.verify keys (head $ OpenPGP.signatures m)
 	assertEqual (keyring ++ " for " ++ message) 1 (length ss)
 
-modifyPacket d@(OpenPGP.LiteralDataPacket {}) = 
-    d { OpenPGP.content = xorbits (OpenPGP.content d) }
-modifyPacket nonliteral = nonliteral
-xorbits bs = LZ.cons 0x00 $ LZ.map (xor 0xFF) bs
-
 testVerifyModifiedMessage :: FilePath -> FilePath -> Assertion
 testVerifyModifiedMessage keyring message = do
-    keys <- fmap decode $ LZ.readFile $ "tests/data/" ++ keyring
-    OpenPGP.Message m <- fmap decode $ LZ.readFile $ "tests/data/" ++ message
-    let corrupt_message = OpenPGP.Message (map modifyPacket m)
-    let OpenPGP.DataSignature _ ss =
-            OpenPGP.verify keys (head $ OpenPGP.signatures corrupt_message)
-    assertEqual (keyring ++ " for " ++ message) 0 (length ss)
+	keys <- fmap decode $ LZ.readFile $ "tests/data/" ++ keyring
+	OpenPGP.Message m <- fmap decode $ LZ.readFile $ "tests/data/" ++ message
+	let corrupt_message = OpenPGP.Message (map modifyLiteralPacket m)
+	let OpenPGP.DataSignature _ ss =
+		OpenPGP.verify keys (head $ OpenPGP.signatures corrupt_message)
+	assertEqual (keyring ++ " for " ++ message) 0 (length ss)
 
 testVerifyKey :: FilePath -> Int -> Assertion
 testVerifyKey keyring count = do
