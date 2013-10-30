@@ -1,15 +1,18 @@
-module Data.OpenPGP.CryptoAPI (fingerprint, sign, verify, encrypt, decryptAsymmetric, decryptSymmetric, decryptSecretKey) where
+module Data.OpenPGP.CryptoAPI (fingerprint, sign, verify, encrypt, decryptAsymmetric, decryptSymmetric, decryptSecretKey,encryptSecretKey) where
 
+import Debug.Trace
 import Data.Char
 import Data.Bits
 import Data.List (find)
-import Data.Maybe (mapMaybe, catMaybes, listToMaybe)
+import Data.Maybe (mapMaybe, catMaybes, listToMaybe,fromJust)
+import Data.Monoid ( (<>) )
 import Control.Arrow
 import Control.Applicative
 import Control.Monad
 import Control.Monad.Trans.Class (lift)
 import Control.Monad.Trans.State (StateT(..), runStateT)
-import Data.Binary (encode, decode, get, Word16)
+import Data.Binary (encode, decode, get, Word16, put)
+import Data.Binary.Put (runPut)
 import Crypto.Classes hiding (cfb,unCfb,sign,verify,encode)
 import Data.Tagged (untag, asTaggedTypeOf, Tagged(..))
 import Crypto.Modes (cfb, unCfb, zeroIV)
@@ -23,6 +26,7 @@ import Crypto.Hash.SHA384 (SHA384)
 import Crypto.Hash.SHA512 (SHA512)
 import Crypto.Hash.SHA224 (SHA224)
 import Crypto.Cipher.AES (AES128,AES192,AES256)
+import Crypto.Cipher.Cast5 (CAST5_128)
 import qualified Data.Serialize as Serialize
 import qualified Crypto.Cipher.RSA as RSA
 import qualified Crypto.Cipher.DSA as DSA
@@ -148,7 +152,9 @@ integerBytesize :: Integer -> Int
 integerBytesize i = fromIntegral $ LZ.length (encode (OpenPGP.MPI i)) - 2
 
 keyParam :: Char -> OpenPGP.Packet -> Integer
-keyParam c k = fromJustMPI $ lookup c (OpenPGP.key k)
+keyParam c k = case lookup c (OpenPGP.key k) of
+                Just (OpenPGP.MPI x) -> x
+                Nothing -> error ("key{"++map fst (OpenPGP.key k)++"} missing param "++show c)
 
 keyAlgorithmIs :: OpenPGP.KeyAlgorithm -> OpenPGP.Packet -> Bool
 keyAlgorithmIs algo p = OpenPGP.key_algorithm p == algo
@@ -401,24 +407,83 @@ decryptSecretKey pass k@(OpenPGP.SecretKeyPacket {
 		OpenPGP.version = 4, OpenPGP.key_algorithm = kalgo,
 		OpenPGP.s2k = s2k, OpenPGP.symmetric_algorithm = salgo,
 		OpenPGP.key = existing, OpenPGP.encrypted_data = encd
-	}) | chkF material == toStrictBS chk =
+	}) | (trace ("get/put check-->"++show (material'==material)) (chkF material == toStrictBS chk)) =
 		fmap (\m -> k {
 			OpenPGP.s2k_useage = 0,
 			OpenPGP.symmetric_algorithm = OpenPGP.Unencrypted,
 			OpenPGP.encrypted_data = LZ.empty,
 			OpenPGP.key = m
-		}) parseMaterial
+		})  parseMaterial
 	   | otherwise = Nothing
 	where
 	parseMaterial = maybeGet
 		(foldM (\m f -> do {mpi <- get; return $ (f,mpi):m}) existing
 		(OpenPGP.secret_key_fields kalgo)) material
+
+	{-
+	material' = fmap (\keyassoc -> 
+						LZ.concat $
+		                        map (encode . (fromJust . flip lookup keyassoc))
+		                            (reverse (OpenPGP.secret_key_fields kalgo)) )
+					 parseMaterial
+	-}
+	material' = runPut $ 
+		forM_ (OpenPGP.secret_key_fields kalgo) $ \f -> do
+			case (parseMaterial >>= lookup f) of
+				Just mpi -> put mpi
+				Nothing  -> trace ("no "++show f++" in "++show (fmap (map fst) parseMaterial)) $ return ()
+
 	(material, chk) = LZ.splitAt (LZ.length decd - chkSize) decd
 	(chkSize, chkF)
 		| OpenPGP.s2k_useage k == 254 = (20, fst . pgpHash OpenPGP.SHA1)
 		| otherwise = (2, Serialize.encode . checksum . toStrictBS)
 	decd = string2sdecrypt salgo s2k (toLazyBS pass) (EncipheredWithIV encd)
 decryptSecretKey _ _ = Nothing
+
+
+encryptSecretKey ::
+    OpenPGP.Packet    -- ^ s2k and encryption specified in SecretKeyPacket form
+    -> BS.ByteString  -- ^ Passphrase
+    -> OpenPGP.Packet -- ^ Unencrypted SecretKeyPacket
+    -> OpenPGP.Packet -- ^ Encrypted SecretKeyPacket
+encryptSecretKey params@(OpenPGP.SecretKeyPacket {
+                            OpenPGP.s2k = s2k,
+                            OpenPGP.s2k_useage = usage,
+                            OpenPGP.symmetric_algorithm = salgo
+                        })
+                 pass
+                 k
+    = k {
+            OpenPGP.s2k_useage = usage,
+            OpenPGP.s2k = s2k,
+            OpenPGP.symmetric_algorithm = salgo,
+            OpenPGP.encrypted_data = encd,
+            OpenPGP.key = filter (\(f,mpi)-> f `elem` OpenPGP.public_key_fields kalgo)
+                                 (OpenPGP.key k)
+        }
+ where
+    kalgo = OpenPGP.key_algorithm k
+    material = runPut $ 
+        forM_ (OpenPGP.secret_key_fields kalgo) $ \f -> do
+            case (Just (OpenPGP.key k) >>= lookup f) of
+                Just mpi -> put mpi
+                Nothing  -> trace ("Enc no "++show f++" in "++show (fmap (map fst) (Just (OpenPGP.key k)))) $ return ()
+    {-
+    material = let r =
+                    LZ.concat $
+                        map (encode . (fromJust . flip lookup (OpenPGP.key k))) 
+                            (OpenPGP.secret_key_fields kalgo)
+               in trace ("encrypt material = "++show r) r
+    -}
+    {- material = LZ.concat $
+                    map (encode . snd) (OpenPGP.key k) -}
+    chk = toLazyBS $ chkF material
+    decd = material <> chk
+    encd = string2sencrypt salgo s2k (toLazyBS pass) decd
+    (chkSize, chkF)
+        | usage == 254 = (20, fst . pgpHash OpenPGP.SHA1)
+        | otherwise = (2, Serialize.encode . checksum . toStrictBS)
+
 
 -- | Decrypt an OpenPGP message using secret key
 decryptAsymmetric ::
@@ -516,13 +581,16 @@ decodeSymKey OpenPGP.AES128 k = (pgpUnCFB :: AES128 -> Decrypt) <$> sDecode k
 decodeSymKey OpenPGP.AES192 k = (pgpUnCFB :: AES192 -> Decrypt) <$> sDecode k
 decodeSymKey OpenPGP.AES256 k = (pgpUnCFB :: AES256 -> Decrypt) <$> sDecode k
 decodeSymKey OpenPGP.Blowfish k = (pgpUnCFB :: Blowfish128 -> Decrypt) <$> sDecode k
+decodeSymKey OpenPGP.CAST5 k = (pgpUnCFB :: CAST5_128 -> Decrypt) <$> sDecode k
 decodeSymKey _ _ = Nothing
+
 
 string2sencrypt :: OpenPGP.SymmetricAlgorithm -> OpenPGP.S2K -> LZ.ByteString -> LZ.ByteString -> LZ.ByteString
 string2sencrypt OpenPGP.AES128 s2k s = simpleCFB (string2key s2k s :: AES128) zeroIV
 string2sencrypt OpenPGP.AES192 s2k s = simpleCFB (string2key s2k s :: AES192) zeroIV
 string2sencrypt OpenPGP.AES256 s2k s = simpleCFB (string2key s2k s :: AES256) zeroIV
 string2sencrypt OpenPGP.Blowfish s2k s = simpleCFB (string2key s2k s :: Blowfish128) zeroIV
+string2sencrypt OpenPGP.CAST5 s2k s = simpleCFB (string2key s2k s :: CAST5_128) zeroIV
 string2sencrypt algo _ _ = error $ "Unsupported symmetric algorithm : " ++ show algo ++ " in Data.OpenPGP.CryptoAPI.string2sencrypt"
 
 string2decrypt :: OpenPGP.SymmetricAlgorithm -> OpenPGP.S2K -> LZ.ByteString -> Decrypt
@@ -530,6 +598,7 @@ string2decrypt OpenPGP.AES128 s2k s = pgpUnCFB (string2key s2k s :: AES128)
 string2decrypt OpenPGP.AES192 s2k s = pgpUnCFB (string2key s2k s :: AES192)
 string2decrypt OpenPGP.AES256 s2k s = pgpUnCFB (string2key s2k s :: AES256)
 string2decrypt OpenPGP.Blowfish s2k s = pgpUnCFB (string2key s2k s :: Blowfish128)
+string2decrypt OpenPGP.CAST5 s2k s = pgpUnCFB (string2key s2k s :: CAST5_128)
 string2decrypt algo _ _ = error $ "Unsupported symmetric algorithm : " ++ show algo ++ " in Data.OpenPGP.CryptoAPI.string2decrypt"
 
 string2sdecrypt :: OpenPGP.SymmetricAlgorithm -> OpenPGP.S2K -> LZ.ByteString -> Enciphered -> LZ.ByteString
@@ -537,6 +606,7 @@ string2sdecrypt OpenPGP.AES128 s2k s = withIV $ simpleUnCFB (string2key s2k s ::
 string2sdecrypt OpenPGP.AES192 s2k s = withIV $ simpleUnCFB (string2key s2k s :: AES192)
 string2sdecrypt OpenPGP.AES256 s2k s = withIV $ simpleUnCFB (string2key s2k s :: AES256)
 string2sdecrypt OpenPGP.Blowfish s2k s = withIV $ simpleUnCFB (string2key s2k s :: Blowfish128)
+string2sdecrypt OpenPGP.CAST5 s2k s = withIV $ simpleUnCFB (string2key s2k s :: CAST5_128)
 string2sdecrypt algo _ _ = error $ "Unsupported symmetric algorithm : " ++ show algo ++ " in Data.OpenPGP.CryptoAPI.string2sdecrypt"
 
 data Enciphered = EncipheredWithIV !LZ.ByteString | EncipheredZeroIV !LZ.ByteString

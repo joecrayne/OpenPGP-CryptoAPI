@@ -66,6 +66,7 @@ library
                 tagged,
                 cryptocipher >= 0.3.6 && <= 0.3.7,
                 cryptohash <= 0.9.1,
+                cipher-cast5,
                 cereal
 
 test-suite tests
