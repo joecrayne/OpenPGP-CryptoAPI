@@ -1,6 +1,5 @@
 module Data.OpenPGP.CryptoAPI (fingerprint, sign, verify, encrypt, decryptAsymmetric, decryptSymmetric, decryptSecretKey,encryptSecretKey) where
 
-import Debug.Trace
 import Data.Char
 import Data.Bits
 import Data.List (find)
@@ -152,9 +151,7 @@ integerBytesize :: Integer -> Int
 integerBytesize i = fromIntegral $ LZ.length (encode (OpenPGP.MPI i)) - 2
 
 keyParam :: Char -> OpenPGP.Packet -> Integer
-keyParam c k = case lookup c (OpenPGP.key k) of
-                Just (OpenPGP.MPI x) -> x
-                Nothing -> error ("key{"++map fst (OpenPGP.key k)++"} missing param "++show c)
+keyParam c k = fromJustMPI $ lookup c (OpenPGP.key k)
 
 keyAlgorithmIs :: OpenPGP.KeyAlgorithm -> OpenPGP.Packet -> Bool
 keyAlgorithmIs algo p = OpenPGP.key_algorithm p == algo
@@ -407,32 +404,18 @@ decryptSecretKey pass k@(OpenPGP.SecretKeyPacket {
 		OpenPGP.version = 4, OpenPGP.key_algorithm = kalgo,
 		OpenPGP.s2k = s2k, OpenPGP.symmetric_algorithm = salgo,
 		OpenPGP.key = existing, OpenPGP.encrypted_data = encd
-	}) | (trace ("get/put check-->"++show (material'==material)) (chkF material == toStrictBS chk)) =
+	}) | chkF material == toStrictBS chk =
 		fmap (\m -> k {
 			OpenPGP.s2k_useage = 0,
 			OpenPGP.symmetric_algorithm = OpenPGP.Unencrypted,
 			OpenPGP.encrypted_data = LZ.empty,
 			OpenPGP.key = m
-		})  parseMaterial
+		}) parseMaterial
 	   | otherwise = Nothing
 	where
 	parseMaterial = maybeGet
 		(foldM (\m f -> do {mpi <- get; return $ (f,mpi):m}) existing
 		(OpenPGP.secret_key_fields kalgo)) material
-
-	{-
-	material' = fmap (\keyassoc -> 
-						LZ.concat $
-		                        map (encode . (fromJust . flip lookup keyassoc))
-		                            (reverse (OpenPGP.secret_key_fields kalgo)) )
-					 parseMaterial
-	-}
-	material' = runPut $ 
-		forM_ (OpenPGP.secret_key_fields kalgo) $ \f -> do
-			case (parseMaterial >>= lookup f) of
-				Just mpi -> put mpi
-				Nothing  -> trace ("no "++show f++" in "++show (fmap (map fst) parseMaterial)) $ return ()
-
 	(material, chk) = LZ.splitAt (LZ.length decd - chkSize) decd
 	(chkSize, chkF)
 		| OpenPGP.s2k_useage k == 254 = (20, fst . pgpHash OpenPGP.SHA1)
@@ -467,7 +450,7 @@ encryptSecretKey params@(OpenPGP.SecretKeyPacket {
         forM_ (OpenPGP.secret_key_fields kalgo) $ \f -> do
             case (Just (OpenPGP.key k) >>= lookup f) of
                 Just mpi -> put mpi
-                Nothing  -> trace ("Enc no "++show f++" in "++show (fmap (map fst) (Just (OpenPGP.key k)))) $ return ()
+                Nothing  -> return () -- trace ("Enc no "++show f++" in "++show (fmap (map fst) (Just (OpenPGP.key k)))) $ return ()
     {-
     material = let r =
                     LZ.concat $
